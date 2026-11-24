@@ -1,22 +1,26 @@
-# MoveInSync Shift-Change Agent
+# MoveInSync Shift-Change Request Agent
 
-A small FastAPI + LangGraph service that handles employee roster-change requests for two sample companies. SQLite stores the roster, company policies, requests, and conversation state. Redis provides a short-lived seat lock; SQLite transactions remain the final authority for seat allocation.
+## Case-study submission
 
-## Run it
+This repository contains my implementation of the **AI Developer, campus case study A**: a chat agent for handling employee transport shift-change requests. It demonstrates how an assistant can interpret a request, check a roster and available cabs, apply company-specific rules, and route policy exceptions to a manager.
 
-From this directory, run:
+This is a self-contained prototype built for the case study. It uses generated sample data and mock services; it does not connect to MoveInSync production systems or use real employee information.
+
+## Run the application
+
+The application starts with one command from this directory:
 
 ```powershell
 docker compose up --build
 ```
 
-The demo chat UI is at `http://localhost:8000`; the API is documented at `http://localhost:8000/docs`. Docker Compose starts the app and Redis, and the app seeds Acme and Globex sample data on first startup. Persisted SQLite and Redis data are stored in Compose volumes.
+Open the chat UI at <http://localhost:8000> or the API documentation at <http://localhost:8000/docs>. On first startup, the app seeds sample roster and policy data for Acme and Globex. SQLite and Redis data persist in Docker volumes.
 
-An API key is optional for local use. Without `GEMINI_API_KEY`, the app uses a deliberately small deterministic intent parser so that the demo remains runnable. To enable Gemini intent extraction, set `GEMINI_API_KEY` in the environment before starting Compose. Never put a real key in source control.
+The app runs without an LLM API key using a small deterministic intent parser. To enable Gemini intent extraction, set `GEMINI_API_KEY` in your environment before starting Compose. Never commit a real key.
 
-### Try a request
+### Try the API
 
-The development token issuer only issues tokens for seeded employees and derives the role from the database:
+For local evaluation, the development token issuer creates a token for a seeded employee. The role is read from the sample database:
 
 ```powershell
 curl.exe -X POST http://localhost:8000/auth/token `
@@ -24,7 +28,7 @@ curl.exe -X POST http://localhost:8000/auth/token `
   -d "{\"company_id\":\"acme\",\"employee_id\":\"acme-emp1\"}"
 ```
 
-Use the returned `access_token` as a bearer token in `/chat`:
+Use the returned `access_token` as a bearer token when calling `/chat`, with a request body such as:
 
 ```json
 {
@@ -33,29 +37,41 @@ Use the returned `access_token` as a bearer token in `/chat`:
 }
 ```
 
-The same `conversation_id` carries clarification context across messages. Managers use their own token to call `POST /manager/approve/{request_id}` with `{"approved": true}` or `false`. Employees can check `GET /requests/{request_id}` or `GET /requests`; both are scoped to the token identity.
+Reuse `conversation_id` to continue a conversation after a clarification. Managers use their own token to call `POST /manager/approve/{request_id}` with `{"approved": true}` or `false`. Employees can check their requests through `GET /requests` or `GET /requests/{request_id}`.
 
-The root demo page can connect as a seeded employee or manager without displaying the bearer token. The dev UI and `/auth/token` endpoint are for local evaluation only.
+The root demo page can connect as a seeded employee or manager. Sample employee IDs are `acme-emp1` through `acme-emp5` and `globex-emp1` through `globex-emp4`; manager IDs are `acme-mgr1` and `globex-mgr1`.
 
-Sample employee IDs are `acme-emp1` through `acme-emp5` and `globex-emp1` through `globex-emp4`. Managers are `acme-mgr1` and `globex-mgr1`.
+> **Local demo authentication only:** `/auth/token` and the UI's seeded identities are for evaluation. Before any non-local deployment, disable the development issuer with `DEV_AUTH_ENABLED=false`, use a trusted JWT issuer, and replace the development `JWT_SECRET`.
 
-> `/auth/token` is a demo-only issuer. Set `DEV_AUTH_ENABLED=false` outside the local evaluation environment and supply tokens from a trusted issuer. Replace the development `JWT_SECRET` before any non-local deployment.
+## What the agent handles
 
-## Design
+- Reads only the roster and requests belonging to the company and employee in the verified JWT.
+- Asks a clarifying question instead of guessing when a message is ambiguous, and carries that context into the next message.
+- Checks company cut-offs, trip validity, cab eligibility, and seat availability in application code.
+- Offers another available time when the requested cab is unavailable.
+- Requires explicit employee confirmation before escalating a cut-off exception to the employee's assigned transport manager.
+- Persists pending approvals and conversations so the manager can decide after the service restarts.
+- Returns a plain next step when a tool, model call, approval, or seat reservation fails.
+- Includes concurrency protection for competing seat requests and duplicate submissions.
 
-- **Identity and isolation:** company and employee IDs come exclusively from a verified HS256 JWT. Request models reject extra identity fields. Every roster, cab, request, and conversation lookup is scoped by both IDs; tools close over identity from the token rather than accepting identity as model arguments. Manager authorization additionally checks the employee's assigned manager in SQLite.
-- **LLM boundary:** Gemini (when configured) is used for one task only: extracting `{action, direction, time, date, confirm}`. The output is parsed and allow-listed. The model cannot select a company, employee, roster ID, cab ID, policy verdict, or manager decision. If output is malformed, the app asks the user to retry; it never applies a model-generated confirmation.
-- **LangGraph and tools:** a two-node graph interprets one message and runs scoped roster/cab/change tools. Clarification and option-choice state is serialized in SQLite between graph invocations, so the graph does not need to remain alive between messages.
-- **Policy:** `RulesEngine` applies per-company cut-offs, trip-time validity, company/cab matching, and maximum seats. A cut-off violation creates no request unless the employee explicitly confirms escalation; confirmation creates a pending request and does not change the roster. A manager can approve only their assigned employee's pending request.
-- **Durable pause/resume:** pending requests, manager decisions, roster updates, and chat context live in SQLite. An approval action applies or rejects the stored request and appends the result to that employee's original conversation in one transaction. Recreating the FastAPI process does not lose the pending request or its conversation; employees see the result through chat history or request status.
-- **Seat correctness:** Redis locks reduce contention across app instances. `BEGIN IMMEDIATE`, an atomic `seats_available > 0` update, idempotency lookup, and a database uniqueness constraint provide the correctness guarantee even if Redis is unavailable.
-- **Errors:** model timeout/invalid output, missing roster, full cabs, DB contention, Redis lock contention, and stale approval each return a user-facing next step. Internal exceptions are logged server-side and never returned as stack traces.
+## Design and safety decisions
 
-### LLM call and latency budget
+- **Identity is not model input.** Company and employee identity come only from the verified HS256 JWT. API request models reject extra identity fields; agent tools are scoped from the token. Manager authorization checks the employee's assigned manager in the database.
+- **The model interprets; code decides.** When configured, Gemini extracts only an allow-listed intent (`action`, `direction`, `time`, `date`, and `confirm`). Model output cannot choose a tenant, employee, cab, policy outcome, or manager decision. Malformed output leads to a retry prompt, not a change.
+- **Rules are deterministic.** `RulesEngine` checks policy and cab constraints before any mutation. A cutoff violation never directly changes the roster. A confirmed exception creates a pending manager request; only an authorized manager can resolve it.
+- **Approval state survives restart.** SQLite stores requests, decisions, roster changes, and conversation context. The graph itself is stateless between messages, so there is no in-memory approval workflow to lose.
+- **Seat allocation is atomic.** Redis locks reduce contention, while SQLite transactions, a conditional seat decrement, idempotency checks, and a uniqueness constraint enforce correctness. SQLite remains authoritative if Redis is unavailable.
+- **Failures are surfaced safely.** User-facing messages explain what happened and what to do next; internal exception details are not returned to the chat.
 
-There is **at most one LLM call per employee message** (intent extraction); no response-generation call is made. There are no model retries. Gemini calls have a 2.5-second timeout and `max_retries=0`, leaving the remainder of the 5-second target for local tools and response formatting. No-key runs make zero model calls. Automated tests use no provider and cannot spend quota. Run `python scripts/run_evaluation.py` to regenerate the deterministic evaluation set; it records call counts in the tool-selection case. To measure live end-to-end p95 with your key, run `python scripts/benchmark_latency.py`.
+## LLM call and latency budget
+
+The agent makes **at most one LLM call per employee message** for intent extraction. It does not make a separate response-generation call and configures no provider retries. The Gemini request timeout is capped at 2.5 seconds; local runs without a key make zero model calls. Automated tests use deterministic/fake behavior and do not require a provider or consume quota.
+
+Run `python scripts/benchmark_latency.py` with a valid `GEMINI_API_KEY` to measure end-to-end live-provider latency on your machine. Provider/network p95 was not measured as part of this submission, so the five-second p95 target is not claimed as verified.
 
 ## Tests and evaluation
+
+Install dependencies and run the test suite and evaluation set:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -63,12 +79,13 @@ python -m pytest -q
 python scripts/run_evaluation.py
 ```
 
-`evaluation_set.jsonl` is regenerated with one JSON object per scenario and the required `id`, `input`, `expected`, `actual`, `pass`, and `notes` fields. `evaluation_report.md` records the test run, evaluation outcomes, latency observations, and limitations.
+The tests cover tenant isolation, company-specific cut-offs, clarification/tool behavior, failures, manager approval after restart, seat contention, and duplicate submissions. The evaluation runner writes one JSONL record per case to [`evaluation_set.jsonl`](evaluation_set.jsonl), with the required `id`, `input`, `expected`, `actual`, `pass`, and `notes` fields. See [`evaluation_report.md`](evaluation_report.md) for the recorded scenarios, results, trade-offs, and known limitations.
+
+Last recorded local validation: **22 tests passed** and **7/7 evaluation cases passed**. Docker Compose startup and live Gemini latency should be verified in the submission/evaluation environment.
 
 ## Trade-offs and limitations
 
-- SQLite was chosen for a one-command sample deployment and transactional seat correctness. Redis is used for short seat locks, but no Redis-backed graph checkpoint is needed: the graph is stateless between calls, while approval and conversation data are durable SQLite records. This is simpler than serializing in-flight graph objects and makes a restart easy to reason about. SQLite is not a substitute for a production multi-region database.
-- The development parser intentionally supports common time phrasing rather than unrestricted language. If the model is absent or returns untrusted output, the assistant asks for clarification instead of guessing.
-- The sample roster is generated for the next local calendar day and covers a small set of employees/routes. This is a behavior prototype, not a production dispatch or identity system.
-- Approval is an explicit policy exception path: an employee confirms escalation, then the assigned manager may approve it. The cut-off request itself never mutates the roster; a full cab at approval cancels the request and tells the manager to ask the employee to choose again.
-- The benchmark/evaluation suite uses fake or deterministic intent results. The actual Gemini network p95 depends on provider/network conditions; the configured hard timeout bounds the model portion, but this repository cannot certify a real-provider p95 without a valid API key and a run on the evaluator's machine.
+- SQLite keeps the sample easy to run and provides transactional seat correctness. It is not a production multi-region datastore; Redis is an optional coordination layer, not the source of truth.
+- The no-key parser intentionally handles common request phrasing rather than unrestricted language. When it cannot safely interpret a request, it asks for clarification.
+- Sample roster data is generated for a nearby local date and a small set of employees and routes. The token issuer, UI, and mock services are evaluation scaffolding, not production identity or dispatch systems.
+- The model timeout bounds the configured Gemini call, but does not by itself prove the overall five-second p95 goal. Actual performance depends on the environment and provider.
