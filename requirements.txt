@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-jose[cryptography]
+langgraph>=0.2.60
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+redis
+httpx
+pytest
+pytest-asyncio

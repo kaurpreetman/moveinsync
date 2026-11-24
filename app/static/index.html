@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoveInSync Shift-Change Assistant</title>
+  <style>
+    :root { color-scheme: light; font-family: Segoe UI, sans-serif; color: #17243b; background: #f3f6fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    main { width: min(760px, 100%); background: white; border: 1px solid #dfe6f0; border-radius: 18px; box-shadow: 0 16px 48px #13284914; overflow: hidden; }
+    header { padding: 24px 28px; color: white; background: #123b70; }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    header p { margin: 0; color: #d6e5fa; font-size: 14px; }
+    .connection, .manager { padding: 16px 24px; display: flex; gap: 10px; align-items: center; border-bottom: 1px solid #e8edf4; }
+    select, input, button { font: inherit; border-radius: 9px; }
+    select, input { border: 1px solid #cbd6e5; padding: 10px 12px; color: inherit; background: white; }
+    select { flex: 1; }
+    button { border: 0; background: #1762ad; color: white; font-weight: 600; padding: 10px 16px; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #identity { color: #52657e; font-size: 13px; padding: 0 24px 12px; }
+    #messages { min-height: 280px; max-height: 48vh; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 12px; }
+    .bubble { max-width: 82%; padding: 12px 14px; border-radius: 14px; white-space: pre-wrap; line-height: 1.4; }
+    .employee { align-self: flex-end; color: white; background: #1762ad; border-bottom-right-radius: 4px; }
+    .assistant { align-self: flex-start; background: #eef3f9; border-bottom-left-radius: 4px; }
+    .status { display: block; margin-top: 6px; color: #52657e; font-size: 11px; }
+    form { display: flex; gap: 10px; padding: 16px 24px 22px; border-top: 1px solid #e8edf4; }
+    form input { flex: 1; }
+    .manager { border-top: 1px solid #e8edf4; border-bottom: 0; flex-wrap: wrap; }
+    .manager strong { width: 100%; font-size: 13px; }
+    .manager input { flex: 1; min-width: 170px; }
+    #notice { padding: 0 24px 16px; min-height: 20px; color: #52657e; font-size: 12px; }
+    @media (max-width: 560px) { .connection, form { flex-wrap: wrap; } .connection select, form input { flex-basis: 100%; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Shift-Change Assistant</h1>
+      <p>Ask for a roster change. Policy checks and approval stay with the service.</p>
+    </header>
+    <section class="connection" aria-label="Demo identity">
+      <label for="identity-choice">Demo user</label>
+      <select id="identity-choice">
+        <option value="acme|acme-emp1">Acme · Alice (employee)</option>
+        <option value="globex|globex-emp1">Globex · Grace (employee)</option>
+        <option value="acme|acme-mgr1">Acme · Frank (manager)</option>
+        <option value="globex|globex-mgr1">Globex · Karen (manager)</option>
+      </select>
+      <button id="connect" type="button">Connect</button>
+    </section>
+    <div id="identity" aria-live="polite">Connect a sample employee to begin.</div>
+    <section id="messages" aria-label="Conversation" aria-live="polite"></section>
+    <form id="chat-form">
+      <input id="message" autocomplete="off" placeholder="e.g. Change my drop to 19:00 tomorrow" required>
+      <button id="send" type="submit" disabled>Send</button>
+    </form>
+    <div id="notice" role="status"></div>
+    <section class="manager" aria-label="Manager action">
+      <strong>Manager action (connect as the assigned manager first)</strong>
+      <input id="request-id" placeholder="Request ID from the assistant">
+      <button id="approve" type="button" disabled>Approve</button>
+      <button id="reject" type="button" disabled>Reject</button>
+    </section>
+  </main>
+  <script>
+    let token = "";
+    let conversationId = "";
+    const identityChoice = document.querySelector("#identity-choice");
+    const identityLabel = document.querySelector("#identity");
+    const connectButton = document.querySelector("#connect");
+    const sendButton = document.querySelector("#send");
+    const messages = document.querySelector("#messages");
+    const notice = document.querySelector("#notice");
+    const requestId = document.querySelector("#request-id");
+    const approveButton = document.querySelector("#approve");
+    const rejectButton = document.querySelector("#reject");
+
+    function addMessage(text, role, status = "") {
+      const bubble = document.createElement("div");
+      bubble.className = `bubble ${role}`;
+      bubble.append(document.createTextNode(text));
+      if (status) {
+        const label = document.createElement("span");
+        label.className = "status";
+        label.textContent = status.replaceAll("_", " ");
+        bubble.append(label);
+      }
+      messages.append(bubble);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function connect() {
+      const [company_id, employee_id] = identityChoice.value.split("|");
+      connectButton.disabled = true;
+      notice.textContent = "";
+      try {
+        const response = await fetch("/auth/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company_id, employee_id })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Could not connect.");
+        token = result.access_token;
+        conversationId = crypto.randomUUID();
+        messages.replaceChildren();
+        identityLabel.textContent = `Connected · ${company_id} / ${employee_id} · ${result.role}`;
+        sendButton.disabled = result.role !== "employee";
+        approveButton.disabled = result.role !== "manager";
+        rejectButton.disabled = result.role !== "manager";
+        notice.textContent = result.role === "employee"
+          ? "Try “Can I go a bit late?” to see clarification and context."
+          : "Use a pending request ID to record your decision.";
+      } catch (error) {
+        token = "";
+        notice.textContent = error.message;
+      } finally {
+        connectButton.disabled = false;
+      }
+    }
+
+    document.querySelector("#chat-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const input = document.querySelector("#message");
+      const text = input.value.trim();
+      if (!token || !text) return;
+      input.value = "";
+      addMessage(text, "employee");
+      sendButton.disabled = true;
+      try {
+        const response = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          body: JSON.stringify({ message: text, conversation_id: conversationId })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || "Chat request failed.");
+        addMessage(result.reply, "assistant", result.status);
+        if (result.request_id) requestId.value = result.request_id;
+        notice.textContent = `LLM calls for this message: ${result.llm_calls}`;
+      } catch (error) {
+        addMessage(error.message, "assistant", "error");
+      } finally {
+        sendButton.disabled = false;
+      }
+    });
+
+    async function decide(approved) {
+      if (!token || !requestId.value.trim()) return;
+      approveButton.disabled = true;
+      rejectButton.disabled = true;
+      try {
+        const response = await fetch(`/manager/approve/${encodeURIComponent(requestId.value.trim())}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          body: JSON.stringify({ approved })
+        });
+        const result = await response.json();
+        notice.textContent = result.message || result.detail || "Decision recorded.";
+      } catch (error) {
+        notice.textContent = error.message;
+      } finally {
+        approveButton.disabled = false;
+        rejectButton.disabled = false;
+      }
+    }
+
+    connectButton.addEventListener("click", connect);
+    approveButton.addEventListener("click", () => decide(true));
+    rejectButton.addEventListener("click", () => decide(false));
+  </script>
+</body>
+</html>

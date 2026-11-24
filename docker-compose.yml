@@ -1,0 +1,35 @@
+version: '3.9'
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-moveinsync-local-dev-secret-change-me}
+      - DEV_AUTH_ENABLED=true
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - DB_PATH=/app/data/moveinsync.db
+    volumes:
+      - app_data:/app/data
+
+volumes:
+  redis_data:
+  app_data:
